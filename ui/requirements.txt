@@ -2,6 +2,14 @@ streamlit==1.32.0
 pandas
 numpy
 plotly
+openpyxl 
 python-dotenv
-requests
-anthropic 
+requests     
+anthropic  
+jupyter
+nbconvert
+ipykernel
+scikit-learn
+torch
+akshare   
+tushare   
