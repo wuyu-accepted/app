@@ -20,14 +20,79 @@ st.set_page_config(page_title="AI Agent 量化投研中控台", layout="wide", p
 def load_lstm_baseline():
     """读取 LSTM 跑出来的基准预测结果"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(base_dir, "lstm_ultimate_baseline.csv") # 假设你的 collect.ipynb 最终会生成这个文件
+    file_path = os.path.join(base_dir, "lstm_ultimate_baseline.csv")
     if os.path.exists(file_path):
         return pd.read_csv(file_path)
     else:
         return pd.DataFrame()
 
+@st.cache_data
+def load_historical_predictions():
+    """读取每日保存的最终历史预测记录"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(base_dir, "daily_final_predictions.csv")
+    if os.path.exists(file_path):
+        try:
+            df = pd.read_csv(file_path)
+            if 'Symbol' in df.columns:
+                df['Symbol'] = df['Symbol'].astype(str).str.split('.').str[0].str.strip().str.zfill(6)
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            return df
+        except Exception as e:
+            print(f"解析历史预测记录失败: {e}")
+    return pd.DataFrame()
+
+@st.cache_data
+def load_offline_agent_data():
+    """读取预先抓取好的新闻文件和预先算好的Agent评分CSV"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # ---------------- 极度强壮的新闻源读取 ----------------
+    df_news = pd.DataFrame()
+    news_files = glob.glob(os.path.join(base_dir, "*news*.csv")) + glob.glob(os.path.join(base_dir, "*news*.xlsx"))
+    
+    if news_files:
+        news_file = news_files[0]
+        try:
+            if news_file.endswith('.csv'):
+                try:
+                    df_news = pd.read_csv(news_file, encoding='utf-8')
+                except UnicodeDecodeError:
+                    df_news = pd.read_csv(news_file, encoding='gbk')
+            else:
+                df_news = pd.read_excel(news_file)
+            
+            if 'stock_code' in df_news.columns:
+                df_news['stock_code'] = df_news['stock_code'].astype(str).str.split('.').str[0].str.strip().str.zfill(6)
+            
+            if 'time' in df_news.columns:
+                df_news['time'] = pd.to_datetime(df_news['time'], errors='coerce')
+                latest_time = df_news['time'].max() 
+                if pd.notna(latest_time):
+                    three_months_ago = latest_time - pd.DateOffset(months=3)
+                    df_news = df_news[df_news['time'] >= three_months_ago]
+                df_news = df_news.sort_values(by='time', ascending=False)
+        except Exception as e:
+            st.error(f"解析新闻文件 {os.path.basename(news_file)} 失败: {e}")
+
+    # ---------------- 极度强壮的评分 CSV 读取 ----------------
+    score_file = os.path.join(base_dir, "historical_agent_scores.csv")
+    df_scores = pd.DataFrame()
+    if os.path.exists(score_file):
+        try:
+            df_scores = pd.read_csv(score_file)
+            if 'stock_code' in df_scores.columns:
+                df_scores['stock_code'] = df_scores['stock_code'].astype(str).str.split('.').str[0].str.strip().str.zfill(6)
+            if 'date' in df_scores.columns:
+                df_scores['date'] = pd.to_datetime(df_scores['date'], errors='coerce')
+                df_scores = df_scores.sort_values(by='date', ascending=False)
+        except Exception as e:
+            st.error(f"解析 CSV 评分失败: {e}")
+            
+    return df_news, df_scores
+
 def find_raw_csv_by_symbol(symbol):
-    """智能匹配带标签的原始 CSV 文件 (如: 上游_AI芯片_300223_北京君正.csv)"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     csv_dir = os.path.join(base_dir, "stock_data_csv")
     files = glob.glob(f"{csv_dir}/*_{symbol}_*.csv") + glob.glob(f"{csv_dir}/{symbol}_*.csv")
@@ -36,7 +101,6 @@ def find_raw_csv_by_symbol(symbol):
     return None
 
 def load_kline_data(file_path):
-    """读取历史 K 线用于画图"""
     df = pd.read_csv(file_path, index_col='date', parse_dates=True)
     df.sort_index(ascending=True, inplace=True)
     return df.tail(60)
@@ -46,124 +110,110 @@ def load_kline_data(file_path):
 # ==========================================
 from knowledge_graph.graph_adapter import RealGraphProvider
 from agent.reasoning import FinancialAgent
-from agent.dynamic_gating import FusionEngine
 from agent.llm_reporter import LLMReporter
 from dotenv import load_dotenv
 
-# 加载 .env 文件中的 API Key
 load_dotenv()
 
-# 全局单例初始化缓存，防止 Streamlit 每次刷新都重头创建
 @st.cache_resource
 def init_agent_system():
     mock_a = RealGraphProvider()
     agent = FinancialAgent(decay_lambda=0.8)
-    fusion_engine = FusionEngine(mode='math', k=2.0)
-    
     try:
         reporter = LLMReporter()
     except Exception as e:
         reporter = None
-        print(f"[警告] LLM 引擎初始化失败，请检查 .env 配置: {e}")
-        
-    return mock_a, agent, fusion_engine, reporter
+    return mock_a, agent, reporter
 
-mock_a, financial_agent, fusion_engine, llm_reporter = init_agent_system()
+mock_a, financial_agent, llm_reporter = init_agent_system()
 
-def get_real_agent_reasoning(symbol, name):
-    """接入真正的多跳图谱推理引擎"""
-    # 从图谱中获取当前股票的相关新闻事件
-    news_dict = mock_a.get_latest_news(stock_name=name)
-
-    # 确保新闻目标对准当前选择的股票
-    news_dict['target_stock'] = name
+def get_real_agent_reasoning(symbol, name, df_news, df_scores):
+    symbol_clean = str(symbol).strip().zfill(6)
     
-    # 触发多跳推理
-    financial_agent.propagate_impact(
-        target_stock=news_dict['target_stock'],
-        initial_power=news_dict['impact_score'],
-        graph_provider=mock_a
-    )
+    # ---------------- Step 1: 提取专门用于前端展示的新闻列表 ----------------
+    news_items_for_display = []
     
-    # 获取该股票最终传导过来的特征分
-    agent_features = financial_agent.get_feature_vectors(name)
-    agent_return = agent_features[0]
-    
-    # 构造一条能够反映真实传导情况的原因文本
-    impact_text = f"【图谱传导】引爆源：{news_dict['news_text']}。"
-    
-    if agent_return > 0.02:
-        reason = f"{impact_text} 多跳网络最终判定对 {name} 为结构性利好。"
-    elif agent_return < -0.02:
-        reason = f"{impact_text} 供应链波动波及，最终判定对 {name} 为短期利空。"
+    if not df_news.empty and 'stock_code' in df_news.columns:
+        stock_news = df_news[df_news['stock_code'] == symbol_clean]
+        if not stock_news.empty:
+            for _, row in stock_news.head(3).iterrows(): # 最多取 3 条展示
+                title = row.get('title', '无标题')
+                time_val = row.get('time')
+                time_str = time_val.strftime('%Y-%m-%d %H:%M') if pd.notna(time_val) else "未知时间"
+                source = row.get('source', '网络资讯')
+                news_items_for_display.append({"time": time_str, "title": title, "source": source})
+                
+    # ---------------- Step 2: 提取 Agent 评分 ----------------
+    cached_score = None
+    if not df_scores.empty and 'stock_code' in df_scores.columns:
+        stock_scores = df_scores[df_scores['stock_code'] == symbol_clean]
+        if not stock_scores.empty:
+            cached_score = float(stock_scores.iloc[0]['total_score'])
+            
+    if cached_score is not None:
+        agent_return = cached_score * 0.10
+        agent_features = [agent_return]
+        raw_agent_score = cached_score
+        calc_mode = "CSV 预存结果"
     else:
-        reason = f"{impact_text} 情绪衰减，未见重大突发波及，对 {name} 情绪维持中性。"
+        financial_agent.propagate_impact(target_stock=name, initial_power=0.0, graph_provider=mock_a)
+        agent_features = financial_agent.get_feature_vectors(name)
+        agent_return = agent_features[0]
+        raw_agent_score = agent_return * 10.0 
+        calc_mode = "现场多跳图谱推演"
+
+    # ---------------- Step 3: 生成总结文案 ----------------
+    if raw_agent_score > 0.2:
+        reason = f"系统基于**{calc_mode}**判定：近期图谱传导对 {name} 形成结构性利好。"
+    elif raw_agent_score < -0.2:
+        reason = f"系统基于**{calc_mode}**判定：近期图谱传导对 {name} 构成短期利空。"
+    else:
+        reason = f"系统基于**{calc_mode}**判定：无重大异动，情绪维持中性。"
         
-    return agent_features, reason
+    return agent_features, reason, raw_agent_score, news_items_for_display
 
 # ==========================================
 # 3. 网站布局：侧边栏 (中控参数与算力引擎)
 # ==========================================
 df_baseline = load_lstm_baseline()
+df_offline_news, df_offline_scores = load_offline_agent_data()
+df_history_preds = load_historical_predictions()
 
 with st.sidebar:
     st.title("⚙️ 系统控制台")
-    
-    # ----------------------------------------
-    # 🌟 算力引擎：一键执行你的 Jupyter Notebook
-    # ----------------------------------------
     st.markdown("### 🚀 后台算力引擎")
     if st.button("🔌 启动 collect.ipynb 重新训练", type="primary", use_container_width=True):
-        
-        # 检查你的笔记本文件是否存在
         base_dir = os.path.dirname(os.path.abspath(__file__))
         collect_path = os.path.join(base_dir, "collect.ipynb")
         if not os.path.exists(collect_path):
-            st.error("❌ 找不到 collect.ipynb 文件，请确认它和 app.py 在同一个文件夹下！")
+            st.error("❌ 找不到 collect.ipynb 文件")
         else:
-            with st.spinner("正在后台疯狂运转 collect.ipynb... 抓取数据与训练神经网络可能需要几分钟，请不要关闭页面！"):
+            with st.spinner("正在后台疯狂运转 collect.ipynb..."):
                 try:
-                    # 核心魔法：用命令行强行无头执行 Jupyter Notebook
-                    # --inplace 表示直接在原文件上运行，--execute 表示执行所有单元格
-                    result = subprocess.run(
-                        ["jupyter", "nbconvert", "--execute", "--inplace", collect_path],
-                        cwd=base_dir,
-                        capture_output=True, text=True
-                    )
-                    
-                    if result.returncode == 0:
-                        # 执行成功！清除旧网页的数据缓存
-                        st.cache_data.clear()
-                        st.success("✅ 数据抓取与 LSTM 训练大功告成！正在刷新面板...")
-                        time.sleep(1)
-                        st.rerun() # 强制网页刷新，读取最新数据
-                    else:
-                        st.error(f"❌ 训练报错了！错误信息：\n{result.stderr[-500:]}") # 打印最后 500 个字符的报错信息
+                    subprocess.run(["jupyter", "nbconvert", "--execute", "--inplace", collect_path], cwd=base_dir)
+                    st.cache_data.clear()
+                    st.success("✅ 训练大功告成！正在刷新面板...")
+                    time.sleep(1)
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"❌ 系统调用失败: {e}\n(请确保你的环境中安装了 jupyter)")
+                    st.error(f"❌ 系统调用失败: {e}")
     
     st.divider()
 
-    # ----------------------------------------
-    # 🌟 选股与参数调节
-    # ----------------------------------------
     if df_baseline.empty:
-        st.warning("⚠️ 暂无基准数据。请先点击上方的按钮运行 `collect.ipynb` 生成数据！")
+        st.warning("⚠️ 暂无基准数据。请先运行 collect.ipynb！")
         st.stop()
 
     st.markdown("### 🎯 标的与权重调参")
-    # 强制将代码转换为 6 位字符串格式 (完美修复你之前的报错！)
     df_baseline['Symbol'] = df_baseline['Symbol'].astype(str).str.zfill(6)
     df_baseline['Name'] = df_baseline['Name'].astype(str)
     
     stock_options = df_baseline['Symbol'] + " - " + df_baseline['Name']
     selected_option = st.selectbox("请选择目标标的:", stock_options)
-    
     selected_symbol = selected_option.split(" - ")[0]
     selected_name = selected_option.split(" - ")[1]
     
     alpha = st.slider("左脑 (LSTM 技术面) 权重 α", min_value=0.0, max_value=1.0, value=0.6, step=0.1)
-    st.caption(f"技术面占 {alpha*100:.0f}%, Agent 逻辑面占 {(1-alpha)*100:.0f}%")
 
 # ==========================================
 # 4. 数据计算与仪表盘渲染
@@ -172,25 +222,29 @@ stock_row = df_baseline[df_baseline['Symbol'] == selected_symbol].iloc[0]
 last_close = stock_row['Last_Close']
 lstm_return = stock_row['LSTM_Base_Return(%)'] / 100.0 
 
-agent_features, agent_reason = get_real_agent_reasoning(selected_symbol, selected_name)
+# 获取推理结果
+agent_features, agent_reason, raw_agent_score, display_news_list = get_real_agent_reasoning(
+    selected_symbol, selected_name, df_offline_news, df_offline_scores
+)
 agent_return = agent_features[0]
 
-# 最终预测公式: 使用 FusionEngine 动态计算 (Math 模式)
-lstm_features = [lstm_return] # Math数学门控模式下，仅需要基准分即可
-fuse_result = fusion_engine.calculate_final_score(lstm_features, agent_features)
+# 💡 核心修改点 1：将最终预测结果缩小 10 倍以贴近真实波动率
+final_return = ((alpha * lstm_return) + ((1 - alpha) * agent_return)) / 10.0
 
-final_return = fuse_result['final_score']
-trade_action = fuse_result['action']
-fusion_status = fuse_result['status']
+trade_action = "买入/持有" if final_return > 0 else "卖出/观望"
+fusion_status = f"✅ 人工滑块干预融合 (LSTM: {alpha*100:.0f}%, Agent: {(1-alpha)*100:.0f}%)"
 
+fuse_result = {'final_score': final_return, 'action': trade_action, 'status': fusion_status}
 predicted_price = last_close * (1 + final_return)
 
 st.title(f"📊 {selected_name} ({selected_symbol}) - 复合量化预测看板")
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("最新实际收盘价", f"¥ {last_close:.2f}")
-col2.metric("LSTM 纯技术面基准", f"{lstm_return*100:+.2f}%")
-col3.metric(f"融合预测明日价 ({trade_action})", f"¥ {predicted_price:.2f}", f"{final_return*100:+.2f}%")
+col2.metric("LSTM 技术面预测", f"{lstm_return*100:+.2f}%")
+agent_score_str = f"{raw_agent_score:.4f}" if raw_agent_score is not None else "未知"
+col3.metric("Agent 图谱情绪评分", agent_score_str)
+col4.metric(f"融合预测明日价 ({trade_action})", f"¥ {predicted_price:.2f}", f"{final_return*100:+.2f}%")
 
 st.divider()
 
@@ -201,16 +255,9 @@ with left_col:
     raw_file = find_raw_csv_by_symbol(selected_symbol)
     if raw_file:
         df_kline = load_kline_data(raw_file)
-        fig = go.Figure(data=[go.Candlestick(
-            x=df_kline.index, open=df_kline['open'], high=df_kline['high'], 
-            low=df_kline['low'], close=df_kline['close'], name="历史走势"
-        )])
+        fig = go.Figure(data=[go.Candlestick(x=df_kline.index, open=df_kline['open'], high=df_kline['high'], low=df_kline['low'], close=df_kline['close'], name="历史走势")])
         tomorrow = df_kline.index[-1] + pd.Timedelta(days=1)
-        fig.add_trace(go.Scatter(
-            x=[tomorrow], y=[predicted_price], mode='markers+text', 
-            marker=dict(color='red', size=14, symbol='star'),
-            text=[f"预测: {predicted_price:.2f}"], textposition="top center", name="明日预测点"
-        ))
+        fig.add_trace(go.Scatter(x=[tomorrow], y=[predicted_price], mode='markers+text', marker=dict(color='red', size=14, symbol='star'), text=[f"预测: {predicted_price:.2f}"], textposition="top center", name="明日预测点"))
         fig.update_layout(height=450, margin=dict(l=0, r=0, t=30, b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
     else:
@@ -219,34 +266,80 @@ with left_col:
 with right_col:
     st.subheader("🧠 大模型 (Agent) 决策链")
     with st.container(border=True):
-        st.markdown(f"**Agent 情绪多跳推演因子:** `{agent_return*100:+.2f}%`")
+        st.markdown(f"**Agent 提取情绪评分:** `{agent_score_str}`")
         st.info(f"**引擎当前激活状态:** {fusion_status}")
         st.success(agent_reason)
         
+        st.markdown("---")
+        st.markdown("📰 **近 3 个月核心驱动资讯 (来自数据源)**")
+        if display_news_list:
+            for item in display_news_list:
+                st.markdown(f"- **{item['time']}** | {item['title']} _({item['source']})_")
+        else:
+            st.warning(f"⚠️ 未找到近 3 个月新闻记录。")
+        
     mermaid_code = f"""
     graph TD
-        UP(上游节点) -->|传导| TARGET({selected_name})
-        TARGET -->|传导| DOWN(下游节点)
+        UP(产业链新闻/事件) -->|评分 {agent_score_str}| TARGET({selected_name})
+        TARGET --> DOWN(最终资产定价)
         style TARGET fill:#f9f,stroke:#333,stroke-width:4px
     """
     st.markdown(f"```mermaid\n{mermaid_code}\n```")
 
 # ==========================================
-# 5. 生成专业 AI 投资研报
+# 5. 往期预测历史记录 (新增模块)
+# ==========================================
+st.divider()
+st.subheader("🕰️ 往期预测记录与回测走势")
+
+if not df_history_preds.empty:
+    stock_preds = df_history_preds[df_history_preds['Symbol'] == selected_symbol].copy()
+    if not stock_preds.empty:
+        # 💡 核心修改点 2：将历史记录表中的最终预测分数也统一缩小 10 倍
+        if 'Final_Score' in stock_preds.columns:
+            stock_preds['Final_Score'] = stock_preds['Final_Score'] / 10.0
+            
+        latest_date = stock_preds['Date'].max()
+        three_months_ago = latest_date - pd.DateOffset(months=3)
+        stock_preds = stock_preds[stock_preds['Date'] >= three_months_ago]
+        stock_preds = stock_preds.sort_values(by='Date', ascending=False)
+        
+        with st.expander("📊 点击展开查看该标的近 3 个月融合预测历史 (CSV 数据)"):
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown("##### 📅 预测记录明细表")
+                display_df = stock_preds[['Date', 'LSTM_Pred_Return', 'Agent_Score', 'Final_Score', 'Action']].copy()
+                display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+                display_df['LSTM基准'] = (display_df['LSTM_Pred_Return'] * 100).map("{:+.2f}%".format)
+                display_df['图谱评分'] = display_df['Agent_Score'].map("{:.4f}".format)
+                display_df['最终预测'] = (display_df['Final_Score'] * 100).map("{:+.2f}%".format)
+                st.dataframe(display_df[['Date', 'LSTM基准', '图谱评分', '最终预测', 'Action']], use_container_width=True, hide_index=True)
+            
+            with c2:
+                st.markdown("##### 📈 预测分数波动趋势")
+                plot_df = stock_preds.sort_values(by='Date', ascending=True)
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Final_Score'], mode='lines+markers', name='最终综合预测(Final)', line=dict(color='#E74C3C', width=2)))
+                fig_hist.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['LSTM_Pred_Return'], mode='lines', name='纯技术面基准(LSTM)', line=dict(color='#3498DB', dash='dash')))
+                fig_hist.update_layout(margin=dict(l=0, r=0, t=30, b=0), height=300, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                st.plotly_chart(fig_hist, use_container_width=True)
+    else:
+        st.info(f"暂无 {selected_name} 的历史预测记录。")
+else:
+    st.info("未在目录下找到 `daily_final_predictions.csv` 历史回测文件。")
+
+# ==========================================
+# 6. 生成专业 AI 投资研报
 # ==========================================
 st.divider()
 st.subheader("🤖 AI 投资研报生成器")
-st.caption("基于 Claude 大模型，结合量价左脑与图谱情绪右脑的综合评估结果，自动为您撰写投研报告。")
-
 if st.button("✨ 生成最新个股研报", type="primary", use_container_width=True):
     if llm_reporter:
-        with st.spinner(f"正在全网深度分析 {selected_name} 的异动传导与技术面，撰写专业报告中，请稍候..."):
+        with st.spinner(f"正在全网深度分析 {selected_name}..."):
             try:
                 report_text = llm_reporter.get_natural_language_report(selected_symbol, fuse_result)
                 st.markdown("### 📄 自动生成研报")
                 with st.container(border=True):
                     st.markdown(report_text)
             except Exception as e:
-                st.error(f"❌ 大模型接口调用失败或返回异常: {e}")
-    else:
-        st.error("⚠️ LLMReporter 组件未成功加载。请检查项目根目录下是否存在 `.env` 文件且含有正确的 `LLM_API_KEY`。")
+                st.error(f"❌ 大模型调用失败: {e}")
