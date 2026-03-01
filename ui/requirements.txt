@@ -13,3 +13,5 @@ scikit-learn
 torch
 akshare   
 tushare   
+torch
+torch_geometric
